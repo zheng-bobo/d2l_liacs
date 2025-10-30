@@ -1,0 +1,484 @@
+import argparse
+import os
+import random
+
+import numpy as np
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow.keras import Input, Model, layers, losses, optimizers
+
+
+TOTAL_MINUTES = 12 * 60
+HOUR_CLASSES = 12
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Multi-head CNN: hour classification + minute regression."
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=os.path.join("A1 Data", "A1_data_75"),
+        help="Directory containing images.npy and labels.npy.",
+    )
+    parser.add_argument("--epochs", type=int, default=30, help="Training epochs.")
+    parser.add_argument("--batch-size", type=int, default=64, help="Mini-batch size.")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=1e-4,
+        help="Weight decay coefficient for AdamW.",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="gpu",
+        choices=["auto", "cpu", "gpu"],
+        help="Device preference. 'auto' uses GPU when available.",
+    )
+    args, unknown = parser.parse_known_args()
+    if unknown:
+        print("Ignoring unrecognized arguments: {}".format(unknown))
+    return args
+
+
+def wraparound_minutes(pred_minutes, true_minutes):
+    diff = np.abs(pred_minutes - true_minutes)
+    return np.minimum(diff, TOTAL_MINUTES - diff)
+
+
+class ClockMultiDataset:
+    """Prepare inputs for multi-head prediction."""
+
+    def __init__(self, data_dir, batch_size, seed):
+        self.data_dir = data_dir
+        self.batch_size = batch_size
+        self.seed = seed
+
+        self.images = None
+        self.labels_hm = None
+
+        self.train_images = None
+        self.val_images = None
+        self.test_images = None
+
+        self.train_hours = None
+        self.val_hours = None
+        self.test_hours = None
+
+        self.train_hour_onehot = None
+        self.val_hour_onehot = None
+        self.test_hour_onehot = None
+
+        self.train_min_targets = None
+        self.val_min_targets = None
+        self.test_min_targets = None
+
+        self.train_minutes_full = None
+        self.val_minutes_full = None
+        self.test_minutes_full = None
+
+        self.input_shape = None
+
+        self.load_data()
+        self.preprocess()
+        self.split_data()
+
+    def load_data(self):
+        images_path = os.path.join(self.data_dir, "images.npy")
+        labels_path = os.path.join(self.data_dir, "labels.npy")
+
+        if not os.path.exists(images_path) or not os.path.exists(labels_path):
+            raise FileNotFoundError(
+                "Could not find images/labels in {}".format(self.data_dir)
+            )
+
+        self.images = np.load(images_path)
+        self.labels_hm = np.load(labels_path)
+
+        if self.images.ndim != 3:
+            raise ValueError(
+                "Expected images with shape (N,H,W), got {}".format(self.images.shape)
+            )
+        if self.labels_hm.shape[-1] != 2:
+            raise ValueError("Labels should have shape (N, 2) for hour and minute.")
+
+    def preprocess(self):
+        images = self.images.astype(np.float32) / 255.0
+        images = np.expand_dims(images, -1)
+
+        hours = (self.labels_hm[:, 0] % 12).astype(np.int32)
+        minutes = self.labels_hm[:, 1].astype(np.float32)
+
+        hour_onehot = tf.keras.utils.to_categorical(hours, HOUR_CLASSES).astype(
+            np.float32
+        )
+        minute_targets = minutes / 60.0  # regression head predicts [0,1]
+
+        self.images = images
+        self.hours = hours
+        self.hour_onehot = hour_onehot
+        self.minute_targets = minute_targets
+        self.minutes_full = hours * 60.0 + minutes
+        self.input_shape = images.shape[1:]
+
+    def split_data(self):
+        rng = np.random.default_rng(self.seed)
+        indices = rng.permutation(len(self.images))
+
+        n_total = len(indices)
+        n_train = int(0.8 * n_total)
+        n_val = int(0.1 * n_total)
+
+        train_idx = indices[:n_train]
+        val_idx = indices[n_train : n_train + n_val]
+        test_idx = indices[n_train + n_val :]
+
+        self.train_images = self.images[train_idx]
+        self.val_images = self.images[val_idx]
+        self.test_images = self.images[test_idx]
+
+        self.train_hours = self.hours[train_idx]
+        self.val_hours = self.hours[val_idx]
+        self.test_hours = self.hours[test_idx]
+
+        self.train_hour_onehot = self.hour_onehot[train_idx]
+        self.val_hour_onehot = self.hour_onehot[val_idx]
+        self.test_hour_onehot = self.hour_onehot[test_idx]
+
+        self.train_min_targets = self.minute_targets[train_idx]
+        self.val_min_targets = self.minute_targets[val_idx]
+        self.test_min_targets = self.minute_targets[test_idx]
+
+        self.train_minutes_full = self.minutes_full[train_idx]
+        self.val_minutes_full = self.minutes_full[val_idx]
+        self.test_minutes_full = self.minutes_full[test_idx]
+
+
+class CommonSenseMultiCallback(tf.keras.callbacks.Callback):
+    """Calculate wrap-around minute error combining hour + minute heads."""
+
+    def __init__(self, trainer):
+        super().__init__()
+        self.trainer = trainer
+
+    def on_epoch_end(self, epoch, logs=None):
+        dataset = self.trainer.dataset
+        hour_probs, minute_preds = self.model.predict(
+            dataset.val_images, batch_size=dataset.batch_size, verbose=0
+        )
+        hour_class = np.argmax(hour_probs, axis=1)
+        minute_val = np.clip(minute_preds.squeeze() * 60.0, 0.0, 59.999)
+        pred_minutes = hour_class * 60.0 + minute_val
+        diffs = wraparound_minutes(pred_minutes, dataset.val_minutes_full)
+
+        metrics_dict = {
+            "mean_diff": float(np.nanmean(diffs)),
+            "median_diff": float(np.nanmedian(diffs)),
+            "pct_within_5": float(np.nanmean(diffs <= 5)),
+            "pct_within_15": float(np.nanmean(diffs <= 15)),
+        }
+        self.trainer.last_val_metrics = metrics_dict
+        self.trainer.cs_history.append(metrics_dict)
+
+        print(
+            "  -> val_mean_diff={:.2f} min, median={:.2f}, within5={:.3f}, within15={:.3f}".format(
+                metrics_dict["mean_diff"],
+                metrics_dict["median_diff"],
+                metrics_dict["pct_within_5"],
+                metrics_dict["pct_within_15"],
+            )
+        )
+
+        if metrics_dict["mean_diff"] < self.trainer.best_val_diff:
+            self.trainer.best_val_diff = metrics_dict["mean_diff"]
+            self.trainer.best_epoch = epoch + 1
+            self.trainer.best_weights = self.model.get_weights()
+
+        if logs is not None:
+            logs["val_mean_diff"] = metrics_dict["mean_diff"]
+
+
+class ClockMultiHeadTrainer:
+    """Hour classification + minute regression multi-head trainer."""
+
+    def __init__(self, dataset, learning_rate, weight_decay):
+        if dataset.input_shape is None:
+            raise ValueError("Dataset input_shape is missing.")
+
+        self.dataset = dataset
+        self.model = self.build_model(dataset.input_shape)
+        self.optimizer = optimizers.AdamW(
+            learning_rate=learning_rate, weight_decay=weight_decay
+        )
+
+        self.model.compile(
+            optimizer=self.optimizer,
+            loss={
+                "hour_head": losses.CategoricalCrossentropy(from_logits=False),
+                "minute_head": losses.MeanSquaredError(),
+            },
+            metrics={
+                "hour_head": ["accuracy"],
+                "minute_head": [tf.keras.metrics.MeanAbsoluteError()],
+            },
+            loss_weights={"hour_head": 1.0, "minute_head": 1.0},
+        )
+
+        self.best_epoch = 0
+        self.best_val_diff = float("inf")
+        self.best_weights = None
+        self.last_val_metrics = None
+        self.history_obj = None
+        self.cs_history = []
+
+    @staticmethod
+    def build_model(input_shape):
+        inputs = Input(shape=input_shape)
+        x = layers.Conv2D(32, 3, padding="same", use_bias=False)(inputs)
+        x = layers.BatchNormalization()(x)
+        x = layers.ReLU()(x)
+        x = layers.MaxPool2D()(x)
+
+        x = layers.Conv2D(64, 3, padding="same", use_bias=False)(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.ReLU()(x)
+        x = layers.MaxPool2D()(x)
+
+        x = layers.Conv2D(128, 3, padding="same", use_bias=False)(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.ReLU()(x)
+        x = layers.MaxPool2D()(x)
+
+        x = layers.Conv2D(256, 3, padding="same", use_bias=False)(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.ReLU()(x)
+        x = layers.GlobalAveragePooling2D()(x)
+
+        x = layers.Dense(256, activation="relu")(x)
+        x = layers.Dropout(0.3)(x)
+
+        hour_output = layers.Dense(
+            HOUR_CLASSES, activation="softmax", name="hour_head"
+        )(x)
+        minute_output = layers.Dense(1, activation="sigmoid", name="minute_head")(x)
+
+        return Model(inputs=inputs, outputs=[hour_output, minute_output])
+
+    def fit(self, epochs):
+        callback = CommonSenseMultiCallback(self)
+        history = self.model.fit(
+            self.dataset.train_images,
+            {
+                "hour_head": self.dataset.train_hour_onehot,
+                "minute_head": self.dataset.train_min_targets,
+            },
+            epochs=epochs,
+            batch_size=self.dataset.batch_size,
+            shuffle=True,
+            validation_data=(
+                self.dataset.val_images,
+                {
+                    "hour_head": self.dataset.val_hour_onehot,
+                    "minute_head": self.dataset.val_min_targets,
+                },
+            ),
+            callbacks=[callback],
+            verbose=2,
+        )
+        self.history_obj = history.history
+
+        if self.best_weights is not None:
+            self.model.set_weights(self.best_weights)
+            print(
+                "Loaded best model from epoch {} (val mean diff {:.2f} minutes).".format(
+                    self.best_epoch, self.best_val_diff
+                )
+            )
+
+    def evaluate_test(self):
+        results = self.model.evaluate(
+            self.dataset.test_images,
+            {
+                "hour_head": self.dataset.test_hour_onehot,
+                "minute_head": self.dataset.test_min_targets,
+            },
+            batch_size=self.dataset.batch_size,
+            verbose=0,
+            return_dict=True,
+        )
+
+        hour_probs, minute_vals = self.model.predict(
+            self.dataset.test_images, batch_size=self.dataset.batch_size, verbose=0
+        )
+        hour_pred = np.argmax(hour_probs, axis=1)
+        minute_pred = np.clip(minute_vals.squeeze() * 60.0, 0.0, 59.999)
+        pred_minutes = hour_pred * 60.0 + minute_pred
+        diffs = wraparound_minutes(pred_minutes, self.dataset.test_minutes_full)
+
+        metrics_dict = {
+            "loss": float(results["loss"]),
+            "hour_acc": float(results.get("hour_head_accuracy", np.nan)),
+            "minute_mae": float(
+                results.get("minute_head_mean_absolute_error", np.nan) * 60.0
+            ),
+            "mean_diff": float(np.nanmean(diffs)),
+            "median_diff": float(np.nanmedian(diffs)),
+            "pct_within_5": float(np.nanmean(diffs <= 5)),
+            "pct_within_15": float(np.nanmean(diffs <= 15)),
+        }
+
+        print(
+            "Test: loss={:.4f} hour_acc={:.3f} minute_mae={:.2f} mean_diff={:.2f} median_diff={:.2f} within_5={:.3f} within_15={:.3f}".format(
+                metrics_dict["loss"],
+                metrics_dict["hour_acc"],
+                metrics_dict["minute_mae"],
+                metrics_dict["mean_diff"],
+                metrics_dict["median_diff"],
+                metrics_dict["pct_within_5"],
+                metrics_dict["pct_within_15"],
+            )
+        )
+        return metrics_dict
+
+    def plot_metrics(self):
+        if not self.history_obj:
+            print("No training history to plot.")
+            return
+
+        epochs = range(1, len(self.history_obj["loss"]) + 1)
+
+        hour_acc = self.history_obj.get("hour_head_accuracy", [])
+        val_hour_acc = self.history_obj.get("val_hour_head_accuracy", [])
+
+        minute_mae = self.history_obj.get("minute_head_mean_absolute_error", [])
+        val_minute_mae = self.history_obj.get("val_minute_head_mean_absolute_error", [])
+
+        minute_acc = [max(0.0, 1.0 - m * 60.0 / TOTAL_MINUTES) for m in minute_mae]
+        val_minute_acc = [
+            max(0.0, 1.0 - m * 60.0 / TOTAL_MINUTES) for m in val_minute_mae
+        ]
+
+        total_loss = self.history_obj["loss"]
+        val_total_loss = self.history_obj.get("val_loss", [])
+
+        hour_loss = self.history_obj.get("hour_head_loss", [])
+        val_hour_loss = self.history_obj.get("val_hour_head_loss", [])
+
+        minute_loss = self.history_obj.get("minute_head_loss", [])
+        val_minute_loss = self.history_obj.get("val_minute_head_loss", [])
+
+        cs_epochs = range(1, len(self.cs_history) + 1)
+        cs_accuracy = [
+            max(0.0, 1.0 - entry["mean_diff"] / TOTAL_MINUTES)
+            for entry in self.cs_history
+        ]
+
+        plt.figure(figsize=(8, 5))
+        if hour_acc:
+            plt.plot(epochs, hour_acc, label="Train Hour Acc")
+        if val_hour_acc:
+            plt.plot(epochs, val_hour_acc, label="Val Hour Acc")
+        if minute_acc:
+            plt.plot(epochs, minute_acc, label="Train Minute Acc (1 - MAE)")
+        if val_minute_acc:
+            plt.plot(epochs, val_minute_acc, label="Val Minute Acc (1 - MAE)")
+        plt.xlabel("Epoch")
+        plt.ylabel("Accuracy")
+        plt.title("Hour & Minute Accuracies")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig("multihead_accuracy.png", dpi=150)
+        plt.close()
+
+        plt.figure(figsize=(8, 5))
+        plt.plot(epochs, total_loss, label="Train Total Loss")
+        if val_total_loss:
+            plt.plot(epochs, val_total_loss, label="Val Total Loss")
+        if hour_loss:
+            plt.plot(epochs, hour_loss, "--", label="Train Hour Loss")
+        if val_hour_loss:
+            plt.plot(epochs, val_hour_loss, "--", label="Val Hour Loss")
+        if minute_loss:
+            plt.plot(epochs, minute_loss, "--", label="Train Minute Loss")
+        if val_minute_loss:
+            plt.plot(epochs, val_minute_loss, "--", label="Val Minute Loss")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title("Loss Curves")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig("multihead_losses.png", dpi=150)
+        plt.close()
+
+        plt.figure(figsize=(8, 5))
+        plt.plot(cs_epochs, cs_accuracy, label="Val Common-Sense Accuracy")
+        plt.xlabel("Epoch")
+        plt.ylabel("Accuracy (1 - mean_diff/720)")
+        plt.title("Validation Common-Sense Accuracy")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig("multihead_common_sense_accuracy.png", dpi=150)
+        plt.close()
+
+
+def configure_device(preference):
+    if preference == "cpu":
+        try:
+            tf.config.set_visible_devices([], "GPU")
+            print("Forcing CPU execution as requested.")
+        except RuntimeError as exc:
+            print("Could not disable GPU ({}). Continuing on CPU.".format(exc))
+        return
+
+    gpus = tf.config.list_physical_devices("GPU")
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            print("Using GPU: {}".format(gpus[0].name))
+        except RuntimeError as exc:
+            print(
+                "GPU configuration failed ({}); using default device settings.".format(
+                    exc
+                )
+            )
+    else:
+        if preference == "gpu":
+            print("No GPU detected; falling back to CPU.")
+
+
+def main():
+    args = parse_args()
+
+    tf.random.set_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+
+    configure_device(args.device)
+
+    dataset = ClockMultiDataset(
+        data_dir=args.data_dir,
+        batch_size=args.batch_size,
+        seed=args.seed,
+    )
+
+    trainer = ClockMultiHeadTrainer(
+        dataset=dataset,
+        learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+    )
+
+    trainer.fit(args.epochs)
+    trainer.evaluate_test()
+    trainer.plot_metrics()
+
+
+if __name__ == "__main__":
+    main()
